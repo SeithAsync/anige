@@ -54,7 +54,7 @@ AI 自己看不出来。它不记得上一次说了什么，就算记得，也�
 
 ## 一晚上大概这样
 
-先跑过 `bash examples.sh` 放好示范，下面是真敲出来的样子（删了几行，`#` 后面是注解）：
+先跑过 `bash examples.sh` 放好示范，再 `export ROOM_DB=~/.anige/example.db` 指到示范库，下面是真敲出来的样子（删了几行，`#` 后面是注解）：
 
 ```
 $ room 卡                                   # 开窗时 AI 看到的
@@ -97,7 +97,7 @@ $ room 用 焦糖布丁 外面下雨了                 # 藏着的第一次用�
 
 ## 装上（用 Claude Code 的）
 
-要有：Python 3.8 以上（只用标准库）、Claude Code。
+要有：Python 3.8 以上（只用标准库）、Claude Code。`reference/` 里的参考代码另算，见[前端和后端参考](#前端和后端参考)。
 
 1. 放到一个固定的地方，比如 `~/anige/`：
 
@@ -106,10 +106,16 @@ $ room 用 焦糖布丁 外面下雨了                 # 藏着的第一次用�
    chmod +x ~/anige/room ~/anige/room-open.sh ~/anige/room-scene.py ~/anige/examples.sh
    ```
 
-2. 让 AI 能直接敲 `room`：`ln -s ~/anige/room ~/bin/room`（`~/bin` 要在 PATH 里）。
-3. 打开 `settings-hooks.json`，把 `/你放的路径/` 换成真的绝对路径，合进 `~/.claude/settings.json`（或项目的 `.claude/settings.json`）的 `hooks` 里。
+2. 让 AI 能直接敲 `room`：
 
-先看示范：`bash examples.sh`。它写进 `~/.anige/example.db`，每次重建，不碰正式库。
+   ```
+   mkdir -p ~/bin && ln -s ~/anige/room ~/bin/room
+   ```
+
+   `~/bin` 要在 PATH 里：新开一个终端敲 `which room`，打出路径就对了；没打出来，往 `~/.zshrc`（或 `~/.bashrc`）末尾加一行 `export PATH="$HOME/bin:$PATH"`，再开一个新终端。
+3. 打开 `settings-hooks.json`，把 `/你放的路径/` 换成真的绝对路径（比如 `/Users/你的用户名/`；路径里有空格就给整段路径加引号）。然后合进 `~/.claude/settings.json`（或项目的 `.claude/settings.json`）：那边还没有 `"hooks"` 的，把这个文件最外层 `{}` 里的 `"hooks": {…}` 整段抄进去；已经有的，把 `SessionStart`、`UserPromptSubmit`、`PostToolUse` 三项分别并进去，别套两层 `hooks`。改完重开 Claude Code。
+
+先看示范：`bash ~/anige/examples.sh`。它写进 `~/.anige/example.db`，每次重建，不碰正式库。想在示范库上接着敲，先 `export ROOM_DB=~/.anige/example.db`；敲完 `unset ROOM_DB`，就回到正式库。
 
 自己开始放（正式库默认在 `~/.anige/room.db`）：
 
@@ -137,7 +143,7 @@ room 卡
 | AI | `room 加 <分类> <名字>` | 明着加一样 |
 | AI | `room 藏 <分类> <名字> [一句来历]` | 偷偷加，人看不见 |
 | AI | `room 写 X` | 从 stdin 写描述 |
-| AI | `room 屋 <地方>`／`删 X`／`单` | 新开地方／删一样／导出全库 |
+| AI | `room 屋 <地方>`／`删 X`／`单` | 新开地方／删一样／导出 AI 看得见的全部（带描述） |
 | 人 | `room 她卡` | 人看到的暗格（AI 藏的滤掉） |
 | 人 | `room 她点 X [给她\|给AI]` | 人点了一样：次数 +1，打出递给 AI 的一行 |
 | 人 | `room 她藏 <分类> <名字> [一句来历]` | 人偷偷加，AI 看不见 |
@@ -156,7 +162,7 @@ AI 用了、喷了什么，人那边要知道：设环境变量 `ROOM_NOTIFY_CMD
 
 音乐格的描述里放歌名、链接或歌号。`room` 留了两个口子，设了环境变量才走，不设就跟别的格一样：
 
-- `ROOM_LISTEN_CMD`：AI `room 拿` 一首歌时调。描述从 stdin 喂进去，命令打出来的东西直接给 AI 看。可以接一副「听歌的耳朵」——把音频转成听感报告：节奏、情绪怎么走、哪一秒起高潮——AI 先听一遍再决定放不放。没有就不设，AI 只看到描述。
+- `ROOM_LISTEN_CMD`：AI `room 拿` 一首歌时调。描述从 stdin 喂进去，命令打出来的东西直接给 AI 看。可以接一副「听歌的耳朵」——把音频转成听感报告：节奏、情绪怎么走、副歌从哪一秒起——AI 先听一遍再决定放不放。没有就不设，AI 只看到描述。
 - `ROOM_MUSIC_CMD`：AI `room 用` 一首歌时调，在通知对方**之前**。描述从 stdin 喂进去，`ROOM_ITEM`＝歌名，`ROOM_WORDS`＝AI 那句字。接你们的播放器：推进一个网页播放器、调音乐 app 的接口，或者干脆把链接发过去。
 
 两个口子跑失败都不拦暗格，只在回显里多一句人话。
@@ -165,7 +171,7 @@ AI 用了、喷了什么，人那边要知道：设环境变量 `ROOM_NOTIFY_CMD
 
 ## 要按自己情况改的地方
 
-- **称呼**：代码里默认管人叫「她」、管 AI 叫「AI」。改 `room`、`room-scene.py`、`room-open.sh` 顶上的 `HUMAN`（和 `AI`），三处一起改。命令名「她卡／她点／她藏」不跟着变。
+- **称呼**：代码里默认管人叫「她」、管 AI 叫「AI」。改 `room`、`room-scene.py`、`room-open.sh` 顶上的 `HUMAN`（和 `AI`），三处一起改。命令名「她卡／她点／她藏」不跟着变。用了 `reference/` 的前后端，那边的称呼和动词也要跟着改。
 - **分类**：`room` 顶上的 `CATEGORIES`（九类道具＋场景）。
 - **几轮问一次、一场多长、亲密场景那份 skill 叫什么**：`room-scene.py` 顶上的 `EVERY`、`WINDOW_SEC`、`PLAY_SKILL`。
 - **库放哪**：默认 `~/.anige/room.db`，环境变量 `ROOM_DB` 能改。提醒钩子的状态默认在 `~/.anige/room-scene/`，`ROOM_SCENE_DIR` 能改；里面只存时间、物件名和轮数，不存对话。
@@ -177,7 +183,7 @@ AI 用了、喷了什么，人那边要知道：设环境变量 `ROOM_NOTIFY_CMD
 
 ## 前端和后端参考
 
-`reference/` 里是一套 iOS app（SwiftUI）和后台（FastAPI）里暗格那几块的摘录：屋卡、点了挂在输入框上的小签、聊天页正中的小卡、后端记数和记号行。**跑不起来**，网络层、鉴权、把消息递给 AI 的那一步都是占位。拿去喂给你们家的 AI，让它照着改进你们自己的前端和后台。
+`reference/` 里是一套 iOS app（SwiftUI）和后台（FastAPI）里暗格那几块的摘录：屋卡、点了挂在输入框上的小签、聊天页正中的小卡、后端记数和记号行。**跑不起来**，网络层、鉴权、把消息递给 AI 的那一步都是占位。拿去喂给你们家的 AI，让它照着改进你们自己的前端和后台。后端按 Python 3.10 以上和 FastAPI 写，app 按 SwiftUI、iOS 17 以上写。
 
 一条链怎么走、记号行的格式、要守住的几条，见 [`reference/README.md`](reference/README.md)。
 
@@ -185,7 +191,7 @@ AI 用了、喷了什么，人那边要知道：设环境变量 `ROOM_NOTIFY_CMD
 
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)，全文见 [`LICENSE`](LICENSE)。
 
-一句话：拿去用、拿去改都可以，但要署名，不许拿去卖钱，改了再放出来也得用同一个协议。
+一句话：拿去用、拿去改都可以，但要署名、注明改过哪里；只许非商业用途（不只是不许卖钱）；改了再放出来，也得用同一个协议。这是简述，以 `LICENSE` 为准。
 
 ## 署名
 

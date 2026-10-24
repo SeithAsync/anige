@@ -55,6 +55,8 @@ SCENE_PROPS = "给「{}」往前九类里配一两样道具：room 加/藏 <分�
 # 之后只留物——不删的话，AI 下次拿起来又照着那句念一遍
 ORIGIN = "来历："
 ORIGIN_HINT = "想写来历就在名字后面带一句：它从哪儿长出来的、留给什么时候（亮了自动删）"
+# 名字里不许带的字：它们是通知行「X」、记号行 [[room:…|…]] 里的分隔符，带了前端和钩子会认错
+BAD_NAME_CHARS = "|[]「」\n"
 
 
 class RoomError(Exception):
@@ -335,6 +337,8 @@ def add(args, by="ai", hidden=False):
     else:
         require_args(args, 2, "room 加 <分类> <名字>")
         (category, name), origin = args, ""
+    if not name.strip() or any(ch in name for ch in BAD_NAME_CHARS):
+        raise RoomError("名字里别带 | [ ] 「 」 和换行（它们是通知和记号里的分隔符）")
     hidden_from = other(by) if hidden else ""
     with connect() as db:
         taken = db.execute("SELECT hidden_from FROM items WHERE name=?", (name,)).fetchone()

@@ -38,6 +38,8 @@ TARGETS = {"her", "ai"}
 # 一晚第一次点签，整张卡跟着递给 AI，让它这一晚手边有卡；六小时内再点只递一行
 CARD_WINDOW = timedelta(hours=6)
 SURPRISE = " · surprise"
+# 名字里不许带的字：通知行「X」、记号行里的分隔符（跟 CLI 的 BAD_NAME_CHARS 一份）
+BAD_NAME_CHARS = "|[]「」\n"
 ORIGIN = "来历："   # 藏的那句来历（选填）存在描述第一行，亮了就删（跟 CLI 一样）
 
 
@@ -201,6 +203,8 @@ async def add(request: Request):
     body = await _json_object(request)
     category = _text(body, "category")
     item_name = _text(body, "name")
+    if any(ch in item_name for ch in BAD_NAME_CHARS):
+        raise HTTPException(status_code=400, detail="名字里别带 | [ ] 「 」 和换行")
     secret = body.get("secret", False)
     if not isinstance(secret, bool):
         raise HTTPException(status_code=400, detail="secret 只能是 true 或 false")
@@ -275,13 +279,13 @@ def _take_one(db: sqlite3.Connection, item_name: str, place: str, to: str = "her
                    (strip_origin(row["desc"]), item_name))
     cutoff = (datetime.now().astimezone() - CARD_WINDOW).isoformat(timespec="seconds")
     first_tonight = db.execute(
-        "SELECT 1 FROM events WHERE action='take' AND ts > ? LIMIT 1", (cutoff,)
+        "SELECT 1 FROM events WHERE action='tap' AND ts > ? LIMIT 1", (cutoff,)
     ).fetchone() is None
     # 谁动手谁记数：她点的是她自己换上给 AI 看的，这里记；AI 给她穿上的，AI 那边 room 用 时记
     db.execute("UPDATE items SET used=used+1 WHERE name=?", (item_name,))
     used = db.execute("SELECT used FROM items WHERE name=?", (item_name,)).fetchone()[0]
     db.execute(
-        "INSERT INTO events(ts, room, item, action) VALUES (?, ?, ?, 'take')",
+        "INSERT INTO events(ts, room, item, action) VALUES (?, ?, ?, 'tap')",   # 跟 CLI room 她点 同名；CLI 的 room 拿 记 take
         (_now(), place, item_name),
     )
     verb = verb_for(row["category"], to)
@@ -334,6 +338,8 @@ def chat_send_room_part(body: dict, text: str) -> tuple[list[dict], str]:
             if m.group(2) not in {i["item"] for i in room_items}:
                 room_items.append({"item": m.group(2), "room": "", "to": target_of(m.group(1))})
             rest.pop(0)
+        if len(room_items) > 6:
+            raise HTTPException(status_code=400, detail="暗格里的东西一次最多带 6 样")
         if room_items:
             text = "\n".join(rest).strip()
     return room_items, text
@@ -351,6 +357,9 @@ def chat_send_room_part(body: dict, text: str) -> tuple[list[dict], str]:
 #       content = "\n".join(markers) + (f"\n{content}" if content else "")   # 存库/给 app 的正文
 #       to_ai = " ｜ ".join(lines) + (f" {text}" if text else "")             # 递给 AI 的那句
 #   save_user_message(content); deliver_to_ai(to_ai)
+#
+# 注意：上面 take_for_message 自己提交，存消息是后一步。存消息失败时，次数已经记上、她藏的已经亮了，
+# 重发还会再记一次。要严丝合缝，就把记数、存消息、查重记录放进同一个事务（同一个库连接里一起提交）。
 
 
 # ---- AI 那边用了什么：落一张正中卡 ----
@@ -359,7 +368,8 @@ def chat_send_room_part(body: dict, text: str) -> tuple[list[dict], str]:
 #   AI 给她穿了「X」 · surprise
 #   AI 现写的那句话（可以没有）
 # 把 ROOM_NOTIFY_CMD 设成往这个口子 POST，比如：
-#   export ROOM_NOTIFY_CMD='curl -s -X POST -H "x-auth-token: $ANIGE_TOKEN" --data-binary @- http://你们的后台/room/notify'
+# （-f：后台回 4xx/5xx 时 curl 非零退出，CLI 才会报「通知不到对方」，不会误报成功）
+#   export ROOM_NOTIFY_CMD='curl -fsS -X POST -H "x-auth-token: $ANIGE_TOKEN" --data-binary @- http://你们的后台/room/notify'
 _AI_LINE = re.compile(r"^(?P<who>\S+)\s+(?P<verb>[^「]+)「(?P<name>[^」]+)」(?P<surprise> · surprise)?\s*$")
 
 
