@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash /你放的路径/anige/room-open.sh", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 /你放的路径/anige/room-scene.py prompt", "timeout": 5 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill|Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 /你放的路径/anige/room-scene.py tool", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}

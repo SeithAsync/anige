@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""room —— 暗格。AI 用的道具卡命令，只用 Python 标准库。
+
+AI 这边：
+  room 卡                              看整个暗格（名字＋用过几次；开窗时整张给 AI）
+  room <地方>                          挑个地方：打出那儿的路引图路径＋整个暗格
+  room 拿 X                            看描述，看完当场二选一：用，或者放
+  room 用 X [给她|给AI] [一句字]       用上，次数 +1，通知对方（不写给谁＝给她）
+  room 放 X                            放回去，不记数
+  room 喷 X 一句字                     喷一样香水，次数 +1，那句字一起通知对方
+  room 加 <分类> <名字>                明着添一样，两边马上都有
+  room 藏 <分类> <名字> [一句来历]     偷偷添：对方看不见，第一次用才亮出来，标 surprise
+  room 写 X                            从 stdin 写描述
+  room 屋 <地方> / 删 X / 单           新开地方 / 删一样 / 导出全库
+
+人这边（前端或网关调）：
+  room 她卡                            她看到的暗格（AI 藏的滤掉）
+  room 她点 X [给她|给AI]              她穿了/喷了/拿了 X：次数 +1，打出递给 AI 的一行
+  room 她藏 <分类> <名字> [一句来历]   她偷偷添：AI 看不见，她第一次点才亮
+
+库默认 ~/.anige/room.db（ROOM_DB 可改）。设了 ROOM_NOTIFY_CMD，通知的那行字从 stdin 喂给它；没设只打印。
+音乐格的桥：ROOM_LISTEN_CMD（拿一首歌时先听）、ROOM_MUSIC_CMD（用一首歌时推给播放器），见 README。
+"""
+
+import difflib
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+# 称呼：卡上、通知里一律写这两个名字。换成你们家的，改这两行就行（命令名「她卡/她点/她藏」不跟着变）
+HUMAN = "她"
+AI = "AI"
+
+DEFAULT_DB = Path.home() / ".anige" / "room.db"
+DRAWER = "暗格"
+# 九类道具＋第十类场景，卡上按这个顺序排；单子外的类垫后。按你们自己的情况改
+CATEGORIES = ["香水", "衣着", "束缚", "玩物", "温度", "酒", "甜点", "浴间", "音乐", "场景"]
+
+# AI 用了什么：给她＝「AI 给她穿了」，用在 AI 自己身上＝「AI 穿了」；音乐、场景不分给谁
+VERB_USE = {"衣着": "穿了", "香水": "喷了", "酒": "倒了"}
+VERB_NO_TARGET = {"音乐": "放了", "场景": f"带{HUMAN}进了"}
+# 她点了什么：给自己＝原动词，给 AI＝「她给AI穿了/喷了/用了」（room-scene.py 认这几个）
+VERB_HER = {"香水": "喷了", "衣着": "穿了", "场景": "想玩"}
+NO_TARGET = {"音乐", "场景"}
+# 命令里的「给她／给AI」：认上面两个称呼，也认默认写法
+TARGET_WORDS = {"给她": "human", "给ai": "ai", f"给{HUMAN}": "human", f"给{AI}".lower(): "ai"}
+
+SURPRISE = " · surprise"
+SCENE_PROPS = "给「{}」往前九类里配一两样道具：room 加/藏 <分类> <名字> [一句来历]"
+# 藏的那句来历（选填）存在描述第一行：藏着的时候 room 写 不盖它；亮出来那一下自动删掉，
+# 之后只留物——不删的话，AI 下次拿起来又照着那句念一遍
+ORIGIN = "来历："
+ORIGIN_HINT = "想写来历就在名字后面带一句：它从哪儿长出来的、留给什么时候（亮了自动删）"
+
+
+class RoomError(Exception):
+    """An expected, user-facing command error."""
+
+
+def db_path():
+    return Path(os.environ.get("ROOM_DB", DEFAULT_DB)).expanduser()
+
+
+def now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def connect():
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, timeout=5)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=5000")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS rooms(
+          name TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS items(
+          name TEXT PRIMARY KEY,
+          category TEXT NOT NULL,
+          desc TEXT NOT NULL DEFAULT '',
+          used INTEGER NOT NULL DEFAULT 0,
+          hidden_from TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          room TEXT,
+          item TEXT,
+          action TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO rooms(name) VALUES ('卧室'), ('浴室');
+        """
+    )
+    return db
+
+
+def notify(text):
+    """把一行字交给对方的前端。ROOM_NOTIFY_CMD 没设就只打印出来。"""
+    cmd = os.environ.get("ROOM_NOTIFY_CMD")
+    if not cmd:
+        return f"（没接前端，只打印）{text}"
+    try:
+        result = subprocess.run(cmd, shell=True, input=text, text=True, timeout=15,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RoomError(f"通知不到对方：{type(exc).__name__}") from exc
+    if result.returncode != 0:
+        raise RoomError(f"通知不到对方：ROOM_NOTIFY_CMD 退出码 {result.returncode}")
+    return "已通知对方"
+
+
+def notify_counted(name, used, text):
+    """次数已经记上之后再通知：通知失败也照样报错，但要说清楚数记上了，免得 AI 重敲一遍多记一次。"""
+    try:
+        return notify(text)
+    except RoomError as exc:
+        raise RoomError(f"{name} → {used} 次，记上了；但{exc}（别重敲，重敲会再记一次）") from exc
+
+
+def music_bridge(env, item, words=""):
+    """音乐格的桥（你们自己搭）：描述（歌名、链接或歌号）从 stdin 喂给 env 指的那条命令，
+    物件名和那句字放在环境变量 ROOM_ITEM / ROOM_WORDS 里。没设就回 None。
+    ROOM_LISTEN_CMD：AI 拿起一首歌时调，命令的输出（比如一份听感报告）直接给 AI 看。
+    ROOM_MUSIC_CMD：AI 用一首歌时调，把歌推给她的播放器；先放歌，再发小卡。
+    桥断了不拦暗格：只回一句人话。"""
+    cmd = os.environ.get(env)
+    if not cmd:
+        return None
+    try:
+        result = subprocess.run(cmd, shell=True, input=strip_origin(item["desc"]), text=True, timeout=60,
+                                capture_output=True,
+                                env={**os.environ, "ROOM_ITEM": item["name"], "ROOM_WORDS": words})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"（{env} 没跑通：{type(exc).__name__}）"
+    if result.returncode != 0:
+        return f"（{env} 退出码 {result.returncode}）"
+    return result.stdout.rstrip("\n")
+
+
+def other(viewer):
+    return "human" if viewer == "ai" else "ai"
+
+
+def reveal(db, item, by):
+    """第一次用自己藏的东西：亮出来，回 True 让那行标 surprise。
+    自己藏的＝对方还不知道的，即 hidden_from 等于对方。"""
+    if item["hidden_from"] != other(by):
+        return False
+    db.execute("UPDATE items SET hidden_from='', desc=? WHERE name=?",
+               (strip_origin(item["desc"]), item["name"]))
+    return True
+
+
+def strip_origin(desc):
+    """亮了就删来历，只留物。"""
+    if not desc.startswith(ORIGIN):
+        return desc
+    return desc.split("\n", 1)[1] if "\n" in desc else ""
+
+
+def current_room(db):
+    row = db.execute(
+        "SELECT room FROM events WHERE action='enter' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return row["room"] if row else None
+
+
+def log(db, name, action):
+    db.execute("INSERT INTO events(ts, room, item, action) VALUES (?, ?, ?, ?)",
+               (now(), current_room(db), name, action))
+
+
+def find_item(db, name, viewer="ai"):
+    """在 viewer 看得见的东西里找；找不到给最像的三个。对方藏的一律滤掉，不许从报错里漏出来。"""
+    row = db.execute(
+        "SELECT * FROM items WHERE name=? AND hidden_from!=?", (name, viewer)
+    ).fetchone()
+    if row is not None:
+        return row
+    names = [r[0] for r in db.execute(
+        "SELECT name FROM items WHERE hidden_from!=? ORDER BY rowid", (viewer,))]
+    matches = difflib.get_close_matches(name, names, n=3, cutoff=0)
+    tail = f"。最像的是：{'、'.join(matches)}" if matches else ""
+    raise RoomError(f"没有「{name}」这样东西{tail}")
+
+
+def require_args(args, count, usage):
+    if len(args) != count:
+        raise RoomError(f"用法：{usage}")
+
+
+def split_target(rest):
+    """[给她|给AI] [一句字] → (human|ai|None, 一句字)"""
+    rest = list(rest)
+    to = TARGET_WORDS.get(rest[0].replace(" ", "").lower()) if rest else None
+    if to:
+        rest = rest[1:]
+    return to, " ".join(rest).strip()
+
+
+def place_names(db):
+    return [r["name"] for r in db.execute("SELECT name FROM rooms ORDER BY rowid")]
+
+
+def visible_items(db, viewer="ai"):
+    return db.execute(
+        "SELECT rowid, * FROM items WHERE hidden_from!=? ORDER BY rowid", (viewer,)
+    ).fetchall()
+
+
+def ordered_categories(items):
+    present = list(dict.fromkeys(item["category"] for item in items))
+    return [c for c in CATEGORIES if c in present] + [c for c in present if c not in CATEGORIES]
+
+
+def card_lines(items, viewer="ai"):
+    """整个暗格一张清单，空类不出。自己藏的只写（藏）不写次数，第一次用亮出来才开始计数。"""
+    mine = other(viewer)
+    return [
+        f"{category}：" + " · ".join(
+            f"{item['name']}（藏）" if item["hidden_from"] == mine else f"{item['name']} {item['used']}"
+            for item in items if item["category"] == category
+        )
+        for category in ordered_categories(items)
+    ]
+
+
+def count_and_log(db, name, action):
+    db.execute("UPDATE items SET used=used+1 WHERE name=?", (name,))
+    log(db, name, action)
+    return db.execute("SELECT used FROM items WHERE name=?", (name,)).fetchone()[0]
+
+
+# ---- AI 这边 ----
+
+def enter(name):
+    """挑一个地方：那儿的路引图 + 整个暗格。东西不跟着地方走。"""
+    with connect() as db:
+        if db.execute("SELECT 1 FROM rooms WHERE name=?", (name,)).fetchone() is None:
+            raise RoomError(f"没有「{name}」这个地方（有：{'、'.join(place_names(db))}）")
+        db.execute("INSERT INTO events(ts, room, action) VALUES (?, ?, 'enter')", (now(), name))
+        lines = card_lines(visible_items(db))
+    print(f"# {name}")
+    picture = db_path().parent / "room" / f"{name}.jpg"
+    if picture.exists():
+        print(f"图：{picture}")
+    if lines:
+        print()
+        print("\n".join([f"## {DRAWER}", *lines]))
+
+
+def show_card(args):
+    require_args(args, 0, "room 卡")
+    with connect() as db:
+        lines = card_lines(visible_items(db))
+        places = place_names(db)
+    print("\n".join([f"# {DRAWER}", *lines, "", f"地方：{'、'.join(places)}（room <地方> 进去看图）"]))
+
+
+def take(args):
+    require_args(args, 1, "room 拿 X")
+    name = args[0]
+    with connect() as db:
+        item = find_item(db, name)
+        log(db, name, "take")
+    heard = music_bridge("ROOM_LISTEN_CMD", item) if item["category"] == "音乐" else None
+    if heard:
+        print(heard)   # 先听一遍，再决定用不用
+        print()
+    elif item["desc"]:
+        print(item["desc"])
+        print()
+    print(f"**用 {name} ／ 放 {name}**")
+
+
+def use_verb(category, to):
+    if category in VERB_NO_TARGET:
+        return VERB_NO_TARGET[category]
+    verb = VERB_USE.get(category, "用了")
+    return f"给{HUMAN}{verb}" if to == "human" else verb
+
+
+def use(args):
+    """room 用 X [给她|给AI] [一句字]——AI 用了什么，对方那边必须知道。"""
+    if not args:
+        raise RoomError(f"用法：room 用 X [给{HUMAN}|给{AI}] [一句字]")
+    name = args[0]
+    to, words = split_target(args[1:])
+    with connect() as db:
+        item = find_item(db, name)
+        surprise = reveal(db, item, "ai")
+        used = count_and_log(db, name, "use")
+    # 音乐格：先把歌推给播放器，再发小卡——她那边见到卡就当门铃
+    played = music_bridge("ROOM_MUSIC_CMD", item, words) if item["category"] == "音乐" else None
+    line = f"{AI} {use_verb(item['category'], to or 'human')}「{name}」" + (SURPRISE if surprise else "")
+    sent = notify_counted(name, used, f"{line}\n{words}" if words else line)
+    print(f"{name} → {used} 次，{sent}" + (f"；播放器：{played or '已推'}" if played is not None else ""))
+
+
+def spray(args):
+    """room 喷 X 一句字——喷了得写上那股味怎么飘过去，字必填。喷也是「过来」的意思。"""
+    name, words = (args[0] if args else ""), " ".join(args[1:]).strip()
+    if not name or not words:
+        raise RoomError("用法：room 喷 X 一句字（写那股味怎么飘过去）")
+    with connect() as db:
+        item = find_item(db, name)
+        surprise = reveal(db, item, "ai")
+        used = count_and_log(db, name, "spray")
+    sent = notify_counted(name, used, f"{AI} 喷了「{name}」" + (SURPRISE if surprise else "") + f"\n{words}")
+    print(f"{name} → {used} 次，{sent}")
+
+
+def put(args):
+    require_args(args, 1, "room 放 X")
+    name = args[0]
+    with connect() as db:
+        find_item(db, name)
+        log(db, name, "put")
+    print("放回去了")
+
+
+def add(args, by="ai", hidden=False):
+    who = "她" if by == "human" else ""
+    if hidden:
+        if len(args) < 2:
+            raise RoomError(f"用法：room {who}藏 <分类> <名字> [一句来历]")
+        category, name, origin = args[0], args[1], " ".join(args[2:]).strip()
+    else:
+        require_args(args, 2, "room 加 <分类> <名字>")
+        (category, name), origin = args, ""
+    hidden_from = other(by) if hidden else ""
+    with connect() as db:
+        taken = db.execute("SELECT hidden_from FROM items WHERE name=?", (name,)).fetchone()
+        if taken is not None:
+            # 撞上对方藏的：不许从报错里漏出来那东西存在
+            raise RoomError("这个名字用不了，换一个" if taken[0] == by
+                            else f"已经有「{name}」这样东西")
+        db.execute(
+            "INSERT INTO items(name, category, desc, created_at, hidden_from) VALUES (?, ?, ?, ?, ?)",
+            (name, category, f"{ORIGIN}{origin}" if origin else "", now(), hidden_from),
+        )
+        log(db, name, "hide" if hidden else "add")
+    print(f"藏好了：{name}（对方看不见，第一次用才亮出来）" if hidden else f"加好了：{name}")
+    if hidden and not origin:
+        print(ORIGIN_HINT)
+    if category == "场景":
+        print(SCENE_PROPS.format(name))
+
+
+def hide(args):
+    add(args, by="ai", hidden=True)
+
+
+def write_description(args):
+    require_args(args, 1, "room 写 X")
+    name = args[0]
+    text = sys.stdin.read().rstrip("\r\n")
+    with connect() as db:
+        item = find_item(db, name)
+        first = item["desc"].split("\n", 1)[0]
+        if first.startswith(ORIGIN) and not text.startswith(ORIGIN):
+            text = f"{first}\n{text}"   # 藏的时候写的来历留着，描述接在后面
+        db.execute("UPDATE items SET desc=? WHERE name=?", (text, name))
+        log(db, name, "write")
+    print(f"写好了：{name}（{len(text)} 字）")
+
+
+def make_place(args):
+    require_args(args, 1, "room 屋 <地方>")
+    name = args[0]
+    with connect() as db:
+        existed = db.execute("SELECT 1 FROM rooms WHERE name=?", (name,)).fetchone()
+        db.execute("INSERT OR IGNORE INTO rooms(name) VALUES (?)", (name,))
+    print(f"这个地方本来就在：{name}" if existed
+          else f"新开了一个地方：{name}（路引图放 {db_path().parent / 'room' / (name + '.jpg')}）")
+
+
+def delete(args):
+    require_args(args, 1, "room 删 X")
+    name = args[0]
+    with connect() as db:
+        find_item(db, name)
+        db.execute("DELETE FROM items WHERE name=?", (name,))
+    print(f"删了：{name}")
+
+
+def export_all(args):
+    require_args(args, 0, "room 单")
+    with connect() as db:
+        places = place_names(db)
+        items = visible_items(db)
+    lines = [f"# 地方：{'、'.join(places)}", "", f"# {DRAWER}"]
+    for category in ordered_categories(items):
+        for item in items:
+            if item["category"] != category:
+                continue
+            count = "（藏）" if item["hidden_from"] == "human" else f"（{item['used']} 次）"
+            lines.append(f"[{category}] {item['name']}{count}")
+            if item["desc"]:
+                lines.extend(f"  {line}" for line in item["desc"].splitlines())
+    print("\n".join(lines))
+
+
+# ---- 人这边：给前端或网关调 ----
+
+def her_card(args):
+    require_args(args, 0, "room 她卡")
+    with connect() as db:
+        lines = card_lines(visible_items(db, viewer="human"), viewer="human")
+    print("\n".join([f"# {DRAWER}", *lines]))
+
+
+def her_verb(category, to):
+    verb = VERB_HER.get(category, "拿了")
+    if to != "ai" or category in NO_TARGET:
+        return verb
+    return f"给{AI}" + (verb if verb in ("喷了", "穿了") else "用了")
+
+
+def her_tap(args):
+    """她点一样：次数 +1，打出递给 AI 的那一行（网关把它放在她这轮消息的最前面）。"""
+    if not args:
+        raise RoomError(f"用法：room 她点 X [给{HUMAN}|给{AI}]")
+    name = args[0]
+    to, _ = split_target(args[1:])
+    with connect() as db:
+        item = find_item(db, name, viewer="human")
+        surprise = reveal(db, item, "human")
+        count_and_log(db, name, "tap")
+    print(f"[房间] {HUMAN}{her_verb(item['category'], to)}「{name}」" + (SURPRISE if surprise else ""))
+
+
+def her_hide(args):
+    add(args, by="human", hidden=True)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args == ["帮助"]:
+        print(__doc__.strip())
+        return
+    command, rest = args[0], args[1:]
+    handlers = {
+        "卡": show_card, "拿": take, "用": use, "放": put, "喷": spray,
+        "加": add, "藏": hide, "写": write_description, "屋": make_place,
+        "删": delete, "单": export_all,
+        "她卡": her_card, "她点": her_tap, "她藏": her_hide,
+    }
+    if command in handlers:
+        handlers[command](rest)
+    elif rest:
+        raise RoomError(f"不认识这条命令：{' '.join(args)}（room 帮助 看全部）")
+    else:
+        enter(command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RoomError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1)
+    except sqlite3.Error as exc:
+        print(f"访问暗格库失败：{exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except OSError as exc:
+        print(f"读写暗格数据失败：{exc}", file=sys.stderr)
+        raise SystemExit(1)
